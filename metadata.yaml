@@ -1,7 +1,7 @@
 name: astrbot_plugin_feibi_compact
 display_name: 菲比主动上下文压缩
 desc: 管理员手动压缩、独立历史Token估算阈值自动压缩、分块摘要和历史备份。
-version: 1.0.1
+version: 1.0.2
 author: ifddis
 repo: https://github.com/ifddis/astrbot_plugin_feibi_compact
 astrbot_version: ">=4.29.1,<4.30.0"

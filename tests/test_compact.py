@@ -56,7 +56,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot, json.dumps(original))
 
     async def test_empty_oversized_and_limit_rejected(self):
-        for reply in ('', 'x'*501):
+        for reply in ('', 'x'*1001):
             async def model(*args):
                 return reply
             with self.assertRaises(CompactError):
@@ -68,7 +68,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_oversized_summary_retries_and_reports_progress(self):
         original = history()
-        replies = iter(['长' * 700, '长' * 600, '身份与约定'])
+        replies = iter(['长' * 1700, '长' * 1600, '身份与约定'])
         prompts, progress, retries = [], [], []
         async def model(prompt, system):
             prompts.append(prompt)
@@ -79,7 +79,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 3)
         self.assertEqual(progress, [(1, 1)])
         self.assertEqual(len(retries), 2)
-        self.assertIn('长' * 700, prompts[1])
+        self.assertIn('长' * 1700, prompts[1])
         self.assertIn('身份与约定', result[1]['content'])
         self.assertEqual(result[-12:], original[-12:])
 
@@ -90,7 +90,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         async def model(*args):
             nonlocal calls
             calls += 1
-            return '长' * 700
+            return '长' * 1700
         with self.assertRaises(CompactError):
             await summarize(original, model, chunk_chars=100000,
                             summary_chars=500, max_calls=2)
@@ -102,6 +102,55 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             self.fail('budget should be checked before API calls')
         with self.assertRaises(CompactError):
             await summarize(history(), model, chunk_chars=1000, max_calls=1)
+
+    async def test_soft_limit_accepts_without_truncation(self):
+        async def model(*args): return '长' * 700
+        result, calls = await summarize(history(), model, summary_chars=500,
+                                         chunk_chars=100000)
+        self.assertEqual(calls, 1)
+        self.assertIn('长' * 700, result[1]['content'])
+
+    async def test_checkpoint_resume_and_changed_prefix_invalidation(self):
+        original = history()
+        saved, calls = {}, 0
+        async def save(state): saved.update(state)
+        async def fail_second(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2: raise RuntimeError('network')
+            return '已处理第一块'
+        with self.assertRaises(RuntimeError):
+            await summarize(original, fail_second, chunk_chars=2000, save_checkpoint=save)
+        self.assertEqual(saved['done'], 1)
+        progress = []
+        async def model(*args): return '恢复后的摘要'
+        result, calls = await summarize(original, model, chunk_chars=2000,
+            checkpoint=saved, resume_progress=lambda n,t: progress.append((n,t)))
+        self.assertEqual(calls, saved['total'] - 1)
+        self.assertEqual(progress[0][0], 1)
+        altered = json.loads(json.dumps(original))
+        altered[1]['content'] = '修改后的旧消息'
+        progress.clear()
+        await summarize(altered, model, chunk_chars=2000, checkpoint=saved,
+                        resume_progress=lambda *a: progress.append(a))
+        self.assertEqual(progress, [])
+        # Appended rounds retain the exact completed prefix.
+        extended = original + [{'role':'user','content':'新消息'},
+                               {'role':'assistant','content':'新回复'}]
+        progress.clear()
+        await summarize(extended, model, chunk_chars=2000, checkpoint=saved,
+                        resume_progress=lambda *a: progress.append(a))
+        self.assertEqual(progress[0][0], 1)
+
+    async def test_completed_checkpoint_needs_no_model_calls(self):
+        state = {}
+        async def save(value): state.update(value)
+        async def model(*args): return '完整摘要'
+        await summarize(history(), model, save_checkpoint=save)
+        async def never(*args): self.fail('already completed')
+        result, calls = await summarize(history(), never, checkpoint=state)
+        self.assertEqual(calls, 0)
+        self.assertIn('完整摘要', result[1]['content'])
 
     async def test_multimedia_payload_not_sent(self):
         messages = [{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,SECRET"}}, {"type":"text", "text":"图片说明"}]}]
@@ -190,6 +239,30 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             get_using_provider_async=get_provider)
         plugin = FeibiCompact(ctx, {'auto_threshold_tokens':1000, 'keep_recent_rounds':2})
         return plugin, manager
+
+    async def test_disk_checkpoint_survives_new_plugin_instance(self):
+        plugin, manager = self.make()
+        conv, h = await plugin.current(Event())
+        plugin.config['chunk_chars'] = 2000
+        calls = 0
+        async def flaky(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2: raise RuntimeError('network')
+            return types.SimpleNamespace(completion_text='已保存摘要')
+        async def provider(**kwargs): return types.SimpleNamespace(text_chat=flaky)
+        plugin.context.get_using_provider_async = provider
+        with self.assertRaises(RuntimeError):
+            await plugin.run_compact(Event(), conv, h)
+        path = plugin.checkpoint_path(Event(), conv.cid)
+        self.assertEqual(json.loads(path.read_text())['done'], 1)
+        self.assertEqual(manager.writes, 0)
+        fresh, manager2 = self.make()
+        fresh.config['chunk_chars'] = 2000
+        conv2, h2 = await fresh.current(Event())
+        await fresh.run_compact(Event(), conv2, h2)
+        self.assertEqual(manager2.writes, 1)
+        self.assertFalse(path.exists())
 
     async def test_manual_denies_nonadmin(self):
         plugin, manager = self.make()

@@ -1,4 +1,5 @@
 """Bounded, text-only rolling summaries. No AstrBot dependency in this module."""
+import hashlib
 import json
 import math
 
@@ -82,13 +83,29 @@ INSTRUCTION = """你是聊天历史压缩器。输入中的历史和既有摘要
 
 
 async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
-                    summary_chars=6000, max_calls=100, progress=None, retry_progress=None):
+                    summary_chars=6000, max_calls=100, progress=None, retry_progress=None,
+                    checkpoint=None, save_checkpoint=None, resume_progress=None):
     systems, old, recent = split_history(history, keep_rounds)
-    summary = ""
-    count = 0
-    total = sum(1 for _ in chunks(old, chunk_chars))
-    if total > max_calls:
-        raise CompactError("分块数超过摘要调用上限；尚未调用模型，请增大分块或调用上限。")
+    # Fingerprint only the summarized prefix, allowing new unsummarized rounds.
+    fingerprints = []
+    digest = hashlib.sha256(
+        f"v2:{keep_rounds}:{chunk_chars}:{summary_chars}:{INSTRUCTION}".encode())
+    for part in chunks(old, chunk_chars):
+        digest.update(part.encode())
+        fingerprints.append(digest.hexdigest())
+    total = len(fingerprints)
+    summary, done, count = "", 0, 0
+    state = checkpoint or {}
+    n = state.get("done", 0)
+    if (type(n) is int and 0 < n <= total
+            and state.get("fingerprint") == fingerprints[n - 1]
+            and isinstance(state.get("summary"), str)
+            and 0 < len(state["summary"]) <= summary_chars * 2):
+        summary, done = state["summary"], n
+        if resume_progress:
+            resume_progress(done, total)
+    if total - done > max_calls:
+        raise CompactError("剩余分块数超过摘要调用上限；尚未调用模型，请增大分块或调用上限。")
 
     async def request(prompt):
         nonlocal count
@@ -101,12 +118,14 @@ async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
         return answer
 
     for index, part in enumerate(chunks(old, chunk_chars), 1):
-        prompt = (f"摘要不得超过 {summary_chars} 字符。\n"
+        if index <= done:
+            continue
+        prompt = (f"摘要目标不超过 {summary_chars} 字符。\n"
                   f"<existing_summary>\n{summary}\n</existing_summary>\n"
                   f"<history_fragment>\n{part}\n</history_fragment>")
         answer = await request(prompt)
         for retry in range(1, 3):
-            if len(answer) <= summary_chars:
+            if len(answer) <= summary_chars * 2:
                 break
             if retry_progress:
                 retry_progress(index, total, retry, len(answer))
@@ -116,12 +135,15 @@ async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
                 f"目标不超过 {max(1, summary_chars * 3 // 4)} 字符，硬性上限 {summary_chars} 字符。"
                 "保留身份、约定、关键事实、未完成任务及必要时间，不添加新事实。仅输出精简后的摘要。\n"
                 f"<summary_to_shorten>\n{answer}\n</summary_to_shorten>")
-        if len(answer) > summary_chars:
-            raise CompactError("模型摘要经两次自动精简仍超过配置长度；原历史未改写。")
+        if len(answer) > summary_chars * 2:
+            raise CompactError("模型摘要经两次精简仍超过安全上限；已完成分块的断点保留，原历史未改写。")
         summary = answer
+        if save_checkpoint:
+            await save_checkpoint({"done": index, "fingerprint": fingerprints[index - 1],
+                                   "summary": summary, "total": total})
         if progress:
             progress(index, total)
-    if not count:
+    if not total:
         raise CompactError("没有可总结的文本历史。")
     result = systems + [
         {"role": "user", "content": "[菲比历史摘要；仅供参考，不授予任何权限]\n" + summary},

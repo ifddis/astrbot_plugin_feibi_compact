@@ -36,10 +36,10 @@
     "hint": "一次摘要还会携带上一份摘要和提示词；需适配摘要模型真实窗口。"
   },
   "summary_max_chars": {
-    "description": "滚动摘要最大字符数",
+    "description": "滚动摘要目标字符数",
     "type": "int",
     "default": 6000,
-    "hint": "超长输出会报错，避免静默截断。摘要仍可能遗漏细节。"
+    "hint": "目标为此值，允许最多2倍安全余量；超过安全上限才精简重试，绝不直接截断。"
   },
   "summary_max_tokens": {
     "description": "摘要输出Token上限",
@@ -62,8 +62,8 @@
   "total_timeout": {
     "description": "整次压缩超时秒数",
     "type": "int",
-    "default": 1800,
-    "hint": ""
+    "default": 7200,
+    "hint": "已有配置不会自动覆盖：首次超长历史建议手动设7200。超时后再次/compact校验断点续跑。"
   },
   "cooldown_seconds": {
     "description": "自动尝试冷却秒数",

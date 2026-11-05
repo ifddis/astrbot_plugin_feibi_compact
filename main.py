@@ -24,6 +24,9 @@ class FeibiCompact(Star):
         self.backups = self.data_dir / "backups"
         self.backups.mkdir(parents=True, exist_ok=True)
         self.backups.chmod(0o700)
+        self.checkpoints = self.data_dir / "checkpoints"
+        self.checkpoints.mkdir(parents=True, exist_ok=True)
+        self.checkpoints.chmod(0o700)
         self.gate = asyncio.Lock()  # Only one summary chain across all sessions.
         self.last_attempt = {}
         self.active_tasks = set()
@@ -86,6 +89,33 @@ class FeibiCompact(Star):
                            key=lambda p: p.stat().st_mtime_ns)[keep:]:
             path.unlink(missing_ok=True)
 
+    def checkpoint_path(self, event, cid):
+        tag = hashlib.sha256((event.unified_msg_origin + ':' + cid).encode()).hexdigest()
+        return self.checkpoints / (tag + ".json")
+
+    def load_checkpoint(self, path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_checkpoint(self, path, state):
+        temporary = path.with_suffix(".tmp")
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(state, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        # Bound disk use across sessions; active task is the newest checkpoint.
+        for old in sorted(self.checkpoints.glob("*.json"),
+                          key=lambda p: p.stat().st_mtime_ns, reverse=True)[20:]:
+            old.unlink(missing_ok=True)
+
     async def run_compact(self, event, conv, history):
         if self.stopping:
             raise CompactError("插件正在停止。")
@@ -102,6 +132,12 @@ class FeibiCompact(Star):
                 before = estimate(history)
                 logger.info(f"[FeibiCompact] start cid={conv.cid} estimated_tokens={before} backup={backup.name}")
 
+                checkpoint_path = self.checkpoint_path(event, conv.cid)
+                checkpoint = await asyncio.to_thread(self.load_checkpoint, checkpoint_path)
+
+                async def save(state):
+                    await asyncio.to_thread(self.save_checkpoint, checkpoint_path, state)
+
                 async def call(prompt, system):
                     async with asyncio.timeout(self.number("request_timeout", 120, 10, 600)):
                         response = await provider.text_chat(
@@ -111,9 +147,12 @@ class FeibiCompact(Star):
                         )
                     return response.completion_text
 
-                async with asyncio.timeout(self.number("total_timeout", 1800, 30, 7200)):
+                async with asyncio.timeout(self.number("total_timeout", 7200, 30, 7200)):
                     result, calls = await summarize(
                         history, call,
+                        checkpoint=checkpoint, save_checkpoint=save,
+                        resume_progress=lambda n, total: logger.info(
+                            f"[FeibiCompact] cid={conv.cid} resumed_chunk={n}/{total}"),
                         keep_rounds=self.number("keep_recent_rounds", 6, 1, 100),
                         chunk_chars=self.number("chunk_chars", 24000, 2000, 200000),
                         summary_chars=self.number("summary_max_chars", 6000, 500, 30000),
@@ -131,6 +170,7 @@ class FeibiCompact(Star):
                 await self.context.conversation_manager.update_conversation(
                     event.unified_msg_origin, conv.cid, history=result)
                 try:
+                    checkpoint_path.unlink(missing_ok=True)
                     await asyncio.to_thread(self.trim_backups)
                 except OSError:
                     logger.warning("[FeibiCompact] 旧备份清理失败；压缩已保存。")
@@ -160,7 +200,7 @@ class FeibiCompact(Star):
             yield event.plain_result(report)
         except Exception as exc:
             logger.error(f"[FeibiCompact] manual failed: {exc}", exc_info=True)
-            yield event.plain_result(f"压缩未完成：{type(exc).__name__}: {exc}\n失败时不写入半成品；请查看日志。")
+            yield event.plain_result(f"压缩未完成：{type(exc).__name__}: {exc}\n原历史未改写；已完成分块会保存断点，再次 /compact 可尝试续跑。超时请检查 total_timeout。")
 
     @filter.command("compact_status")
     async def status(self, event: AstrMessageEvent):
@@ -178,16 +218,24 @@ class FeibiCompact(Star):
                 f"自动触发阈值：{self.number('auto_threshold_tokens', 120000, 1000, 10000000):,}\n"
                 f"自动压缩：{bool(self.config.get('auto_enabled', True))}\n"
                 f"保留最近轮数：{self.number('keep_recent_rounds', 6, 1, 100)}\n"
-                f"全局压缩执行中：{self.gate.locked()}")
+                f"全局压缩执行中：{self.gate.locked()}\n"
+                f"保存的断点块数（续跑前校验）：{self.load_checkpoint(self.checkpoint_path(event, conv.cid)).get('done', 0)}\n"
+                f"总超时：{self.number('total_timeout', 7200, 30, 7200)} 秒")
         except Exception as exc:
             yield event.plain_result(f"无法读取状态：{exc}")
 
     @filter.on_llm_request(priority=-10000)
     async def auto_compact(self, event: AstrMessageEvent, req: ProviderRequest):
         # AstrBot 4.29.1 calls this hook inside the shared session lock.
-        if (self.stopping or not self.config.get("auto_enabled", True)
-                or not self.allowed(event) or not self.local_runner(event)
-                or not req.conversation or self.gate.locked()):
+        reason = (
+            "stopping" if self.stopping else
+            "disabled" if not self.config.get("auto_enabled", True) else
+            "session_not_allowed" if not self.allowed(event) else
+            "nonlocal_runner" if not self.local_runner(event) else
+            "no_conversation" if not req.conversation else
+            "global_busy" if self.gate.locked() else "")
+        if reason:
+            logger.info(f"[FeibiCompact] auto_skip: {reason}")
             return
         if event.get_extra("feibi_compact_checked", False):
             return
@@ -195,6 +243,7 @@ class FeibiCompact(Star):
         try:
             conv, history = await self.current(event)
             if conv.cid != req.conversation.cid:
+                logger.info("[FeibiCompact] auto_skip: conversation_id_mismatch")
                 return
             # Other plugins may append fresh group deltas. Preserve them, and refuse
             # transformations that cannot be aligned with the persisted prefix.
@@ -202,10 +251,14 @@ class FeibiCompact(Star):
                 logger.warning("[FeibiCompact] request history differs from DB prefix; skipping auto compression")
                 return
             threshold = self.number("auto_threshold_tokens", 120000, 1000, 10000000)
-            if estimate(history) < threshold:
+            tokens = estimate(history)
+            logger.info(f"[FeibiCompact] auto_check cid={conv.cid} estimated_tokens={tokens} threshold={threshold}")
+            if tokens < threshold:
+                logger.info("[FeibiCompact] auto_skip: below_threshold")
                 return
             now = time.monotonic()
             if now - self.last_attempt.get(conv.cid, -1e9) < self.number("cooldown_seconds", 300, 30, 86400):
+                logger.info("[FeibiCompact] auto_skip: cooldown")
                 return
             if len(self.last_attempt) >= 1024:
                 self.last_attempt.pop(next(iter(self.last_attempt)))

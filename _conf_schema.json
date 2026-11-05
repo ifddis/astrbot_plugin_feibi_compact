@@ -1,0 +1,80 @@
+{
+  "auto_enabled": {
+    "description": "启用请求前自动压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "在新聊天请求到来时检查历史，不是后台定时扫描。"
+  },
+  "auto_threshold_tokens": {
+    "description": "历史估算Token触发阈值",
+    "type": "int",
+    "default": 120000,
+    "hint": "独立于真实模型窗口；估算不是计费Token。当前消息/人格/工具定义不在该历史阈值内。"
+  },
+  "summary_provider_id": {
+    "description": "摘要对话模型Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空优先使用AstrBot配置的压缩提供商，再使用当前聊天提供商。不要填Embedding ID。"
+  },
+  "allowed_sessions": {
+    "description": "允许的完整会话UMO列表",
+    "type": "list",
+    "default": [],
+    "hint": "空列表允许所有使用本插件的会话。可用/sid查看UMO。命令仍仅限管理员。"
+  },
+  "keep_recent_rounds": {
+    "description": "原样保留最近对话轮数",
+    "type": "int",
+    "default": 6,
+    "hint": "按user消息边界切分，工具调用及结果跟随整轮保留。"
+  },
+  "chunk_chars": {
+    "description": "单个历史片段最大字符数",
+    "type": "int",
+    "default": 24000,
+    "hint": "一次摘要还会携带上一份摘要和提示词；需适配摘要模型真实窗口。"
+  },
+  "summary_max_chars": {
+    "description": "滚动摘要最大字符数",
+    "type": "int",
+    "default": 6000,
+    "hint": "超长输出会报错，避免静默截断。摘要仍可能遗漏细节。"
+  },
+  "summary_max_tokens": {
+    "description": "摘要输出Token上限",
+    "type": "int",
+    "default": 3000,
+    "hint": "通过max_tokens传递给对话Provider。"
+  },
+  "max_summary_calls": {
+    "description": "单次压缩最大摘要请求数",
+    "type": "int",
+    "default": 100,
+    "hint": "超长首次历史可能需要几十次调用；超限不写入半成品。"
+  },
+  "request_timeout": {
+    "description": "每段摘要超时秒数",
+    "type": "int",
+    "default": 120,
+    "hint": ""
+  },
+  "total_timeout": {
+    "description": "整次压缩超时秒数",
+    "type": "int",
+    "default": 1800,
+    "hint": ""
+  },
+  "cooldown_seconds": {
+    "description": "自动尝试冷却秒数",
+    "type": "int",
+    "default": 300,
+    "hint": "失败也冷却，避免每条消息反复调用。手动命令不受该冷却限制。"
+  },
+  "backup_count": {
+    "description": "保留的历史备份总份数",
+    "type": "int",
+    "default": 20,
+    "hint": "全部会话合计；新备份成功落盘后删除最旧的超额备份，失败尝试的备份也计入。请自行另做长期备份。"
+  }
+}

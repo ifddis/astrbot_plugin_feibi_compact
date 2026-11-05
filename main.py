@@ -118,7 +118,11 @@ class FeibiCompact(Star):
                         chunk_chars=self.number("chunk_chars", 24000, 2000, 200000),
                         summary_chars=self.number("summary_max_chars", 6000, 500, 30000),
                         max_calls=self.number("max_summary_calls", 100, 1, 500),
-                        progress=lambda n: logger.info(f"[FeibiCompact] cid={conv.cid} summarized_chunk={n}"),
+                        progress=lambda n, total: logger.info(
+                            f"[FeibiCompact] cid={conv.cid} summarized_chunk={n}/{total}"),
+                        retry_progress=lambda n, total, retry, chars: logger.info(
+                            f"[FeibiCompact] cid={conv.cid} shortening_chunk={n}/{total} "
+                            f"retry={retry}/2 chars={chars}"),
                     )
                 # The caller holds AstrBot's own session lock. Also reject external edits.
                 current, latest = await self.current(event)

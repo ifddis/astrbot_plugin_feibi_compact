@@ -92,3 +92,7 @@ python -m unittest discover -s astrbot_plugin_feibi_compact/tests -v
 - https://github.com/AstrBotDevs/AstrBot/blob/v4.29.1/astrbot/core/provider/provider.py
 
 实现沿用 AstrBot 的 Provider、会话锁与历史更新接口；超长分块摘要由插件实现，未直接调用会在失败后丢弃历史的内置兜底截断流程。
+
+## 1.0.1 超长摘要重试
+
+模型返回超过 `summary_max_chars` 的摘要时，插件会自动精简，最多两次；不会直接截断文本。所有请求均计入 `max_summary_calls`，原有总超时仍生效。若重试仍失败，原历史保持不变。日志中的 `summarized_chunk=4/50` 表示已完成 4 块、总计 50 块；`shortening_chunk` 表示当前正在精简。进度仅输出到日志。失败后再次执行仍从头总结，本版本不支持断点续跑。

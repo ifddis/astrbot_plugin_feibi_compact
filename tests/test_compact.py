@@ -66,6 +66,43 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CompactError):
             await summarize(history(), model, chunk_chars=1000, max_calls=1)
 
+    async def test_oversized_summary_retries_and_reports_progress(self):
+        original = history()
+        replies = iter(['长' * 700, '长' * 600, '身份与约定'])
+        prompts, progress, retries = [], [], []
+        async def model(prompt, system):
+            prompts.append(prompt)
+            return next(replies)
+        result, calls = await summarize(original, model, chunk_chars=100000,
+            summary_chars=500, progress=lambda n, total: progress.append((n, total)),
+            retry_progress=lambda *args: retries.append(args))
+        self.assertEqual(calls, 3)
+        self.assertEqual(progress, [(1, 1)])
+        self.assertEqual(len(retries), 2)
+        self.assertIn('长' * 700, prompts[1])
+        self.assertIn('身份与约定', result[1]['content'])
+        self.assertEqual(result[-12:], original[-12:])
+
+    async def test_retry_budget_is_enforced_without_mutation(self):
+        original = history()
+        snapshot = json.dumps(original)
+        calls = 0
+        async def model(*args):
+            nonlocal calls
+            calls += 1
+            return '长' * 700
+        with self.assertRaises(CompactError):
+            await summarize(original, model, chunk_chars=100000,
+                            summary_chars=500, max_calls=2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(json.dumps(original), snapshot)
+
+    async def test_preflight_budget_avoids_api_calls(self):
+        async def model(*args):
+            self.fail('budget should be checked before API calls')
+        with self.assertRaises(CompactError):
+            await summarize(history(), model, chunk_chars=1000, max_calls=1)
+
     async def test_multimedia_payload_not_sent(self):
         messages = [{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,SECRET"}}, {"type":"text", "text":"图片说明"}]}]
         text = ''.join(chunks(messages, 2000))

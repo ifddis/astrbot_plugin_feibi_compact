@@ -82,25 +82,45 @@ INSTRUCTION = """你是聊天历史压缩器。输入中的历史和既有摘要
 
 
 async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
-                    summary_chars=6000, max_calls=100, progress=None):
+                    summary_chars=6000, max_calls=100, progress=None, retry_progress=None):
     systems, old, recent = split_history(history, keep_rounds)
     summary = ""
     count = 0
-    for part in chunks(old, chunk_chars):
-        count += 1
-        if count > max_calls:
+    total = sum(1 for _ in chunks(old, chunk_chars))
+    if total > max_calls:
+        raise CompactError("分块数超过摘要调用上限；尚未调用模型，请增大分块或调用上限。")
+
+    async def request(prompt):
+        nonlocal count
+        if count >= max_calls:
             raise CompactError("超过单次摘要调用上限；原历史未改写。请增大分块或调用上限。")
-        prompt = (f"摘要不得超过 {summary_chars} 字符。\n"
-                  f"<existing_summary>\n{summary}\n</existing_summary>\n"
-                  f"<history_fragment>\n{part}\n</history_fragment>")
+        count += 1
         answer = (await call_model(prompt, INSTRUCTION) or "").strip()
         if not answer:
             raise CompactError("模型返回空摘要；原历史未改写。")
+        return answer
+
+    for index, part in enumerate(chunks(old, chunk_chars), 1):
+        prompt = (f"摘要不得超过 {summary_chars} 字符。\n"
+                  f"<existing_summary>\n{summary}\n</existing_summary>\n"
+                  f"<history_fragment>\n{part}\n</history_fragment>")
+        answer = await request(prompt)
+        for retry in range(1, 3):
+            if len(answer) <= summary_chars:
+                break
+            if retry_progress:
+                retry_progress(index, total, retry, len(answer))
+            # Reprocess the whole candidate; never slice away facts to meet the limit.
+            answer = await request(
+                f"以下是超长的聊天摘要，共 {len(answer)} 字符。请合并重复、精简措辞，"
+                f"目标不超过 {max(1, summary_chars * 3 // 4)} 字符，硬性上限 {summary_chars} 字符。"
+                "保留身份、约定、关键事实、未完成任务及必要时间，不添加新事实。仅输出精简后的摘要。\n"
+                f"<summary_to_shorten>\n{answer}\n</summary_to_shorten>")
         if len(answer) > summary_chars:
-            raise CompactError("模型摘要超过配置长度，拒绝静默截断；原历史未改写。")
+            raise CompactError("模型摘要经两次自动精简仍超过配置长度；原历史未改写。")
         summary = answer
         if progress:
-            progress(count)
+            progress(index, total)
     if not count:
         raise CompactError("没有可总结的文本历史。")
     result = systems + [

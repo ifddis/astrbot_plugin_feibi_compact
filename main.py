@@ -139,18 +139,26 @@ class FeibiCompact(Star):
                     await asyncio.to_thread(self.save_checkpoint, checkpoint_path, state)
 
                 async def call(prompt, system):
-                    async with asyncio.timeout(self.number("request_timeout", 120, 10, 600)):
-                        response = await provider.text_chat(
-                            prompt=prompt, contexts=[], system_prompt=system,
-                            request_max_retries=1,
-                            max_tokens=self.number("summary_max_tokens", 3000, 256, 16000),
-                        )
+                    seconds = self.number("request_timeout", 120, 10, 600)
+                    try:
+                        async with asyncio.timeout(seconds):
+                            response = await provider.text_chat(
+                                prompt=prompt, contexts=[], system_prompt=system,
+                                request_max_retries=1,
+                                max_tokens=self.number("summary_max_tokens", 3000, 256, 16000),
+                            )
+                    except TimeoutError as exc:
+                        raise CompactError(
+                            f"单次模型请求超时（{seconds}秒）；请调整 request_timeout 后续跑。") from exc
                     return response.completion_text
 
                 async with asyncio.timeout(self.number("total_timeout", 7200, 30, 7200)):
                     result, calls = await summarize(
                         history, call,
                         checkpoint=checkpoint, save_checkpoint=save,
+                        reduction_progress=lambda n, total, turn, piece, pieces: logger.info(
+                            f"[FeibiCompact] cid={conv.cid} reducing_chunk={n}/{total} "
+                            f"round={turn}/3 piece={piece}/{pieces}"),
                         resume_progress=lambda n, total: logger.info(
                             f"[FeibiCompact] cid={conv.cid} resumed_chunk={n}/{total}"),
                         keep_rounds=self.number("keep_recent_rounds", 6, 1, 100),
@@ -164,6 +172,8 @@ class FeibiCompact(Star):
                             f"retry={retry}/2 chars={chars}"),
                     )
                 # The caller holds AstrBot's own session lock. Also reject external edits.
+                if self.stopping:
+                    raise CompactError("插件已停止，保留断点，不提交历史。")
                 current, latest = await self.current(event)
                 if current.cid != conv.cid or latest != history:
                     raise CompactError("总结期间历史或对话已改变，放弃写入；原始备份保留。")
@@ -177,7 +187,13 @@ class FeibiCompact(Star):
                 after = estimate(result)
                 logger.info(f"[FeibiCompact] committed cid={conv.cid} estimated_tokens={before}->{after} calls={calls}")
                 return result, f"压缩完成：估算 {before:,} → {after:,} Token；{calls} 次摘要调用。\n备份：{backup.name}"
+            except TimeoutError as exc:
+                raise CompactError("整次压缩超时；请调整 total_timeout 后续跑，已完成断点保留。") from exc
             finally:
+                # Start cooldown when work finishes, not when a long attempt starts.
+                if len(self.last_attempt) >= 1024 and conv.cid not in self.last_attempt:
+                    self.last_attempt.pop(next(iter(self.last_attempt)))
+                self.last_attempt[conv.cid] = time.monotonic()
                 self.active_tasks.discard(task)
 
     @filter.command("compact")
@@ -200,7 +216,7 @@ class FeibiCompact(Star):
             yield event.plain_result(report)
         except Exception as exc:
             logger.error(f"[FeibiCompact] manual failed: {exc}", exc_info=True)
-            yield event.plain_result(f"压缩未完成：{type(exc).__name__}: {exc}\n原历史未改写；已完成分块会保存断点，再次 /compact 可尝试续跑。超时请检查 total_timeout。")
+            yield event.plain_result(f"压缩未完成：{type(exc).__name__}: {exc}\n原历史未改写；已完成分块会保存断点，再次 /compact 可尝试续跑。若模型不遵守精简要求，可更换 summary_provider_id；无需改分块或摘要长度。")
 
     @filter.command("compact_status")
     async def status(self, event: AstrMessageEvent):
@@ -304,4 +320,9 @@ class FeibiCompact(Star):
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=10)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            if pending:
+                logger.warning("[FeibiCompact] 停止等待已达10秒；残留请求不会提交聊天历史。")

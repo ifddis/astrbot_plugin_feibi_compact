@@ -84,7 +84,7 @@ INSTRUCTION = """你是聊天历史压缩器。输入中的历史和既有摘要
 
 async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
                     summary_chars=6000, max_calls=100, progress=None, retry_progress=None,
-                    checkpoint=None, save_checkpoint=None, resume_progress=None):
+                    checkpoint=None, save_checkpoint=None, resume_progress=None, reduction_progress=None):
     systems, old, recent = split_history(history, keep_rounds)
     # Fingerprint only the summarized prefix, allowing new unsummarized rounds.
     fingerprints = []
@@ -117,6 +117,36 @@ async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
             raise CompactError("模型返回空摘要；原历史未改写。")
         return answer
 
+    async def reduce_in_parts(text, index):
+        # Keep the v2 checkpoint fingerprint unchanged: only the reduction method changes.
+        # Process all input slices; never silently truncate a candidate.
+        for round_no in range(1, 4):
+            if len(text) <= summary_chars * 2:
+                return text
+            size = max(500, min(summary_chars, 4000))
+            pieces = math.ceil(len(text) / size)
+            reduced = []
+            for offset in range(0, len(text), size):
+                piece_no = offset // size + 1
+                piece = text[offset:offset + size]
+                if reduction_progress:
+                    reduction_progress(index, total, round_no, piece_no, pieces)
+                target = max(100, min(len(piece) // 2, summary_chars // pieces))
+                reduced.append(await request(
+                    f"将这段聊天摘要精简为最多 {target} 字符的事实要点。"
+                    "合并重复、删除修饰，保留身份对应、约定、任务与关键时间，"
+                    "不要扩写，不添加事实，仅输出精简正文。\n"
+                    f"<summary_piece>\n{piece}\n</summary_piece>"))
+            candidate = "\n".join(reduced)
+            if len(candidate) <= summary_chars * 2:
+                return candidate
+            if len(candidate) >= len(text):
+                raise CompactError("摘要模型分段精简仍未缩短文本；请更换摘要Provider后续跑，"
+                                   "已完成断点保留，原历史未改写。")
+            text = candidate
+        raise CompactError("分段精简三轮后仍超安全上限；请更换摘要Provider后续跑，"
+                           "已完成断点保留，原历史未改写。")
+
     for index, part in enumerate(chunks(old, chunk_chars), 1):
         if index <= done:
             continue
@@ -136,7 +166,7 @@ async def summarize(history, call_model, *, keep_rounds=6, chunk_chars=24000,
                 "保留身份、约定、关键事实、未完成任务及必要时间，不添加新事实。仅输出精简后的摘要。\n"
                 f"<summary_to_shorten>\n{answer}\n</summary_to_shorten>")
         if len(answer) > summary_chars * 2:
-            raise CompactError("模型摘要经两次精简仍超过安全上限；已完成分块的断点保留，原历史未改写。")
+            answer = await reduce_in_parts(answer, index)
         summary = answer
         if save_checkpoint:
             await save_checkpoint({"done": index, "fingerprint": fingerprints[index - 1],

@@ -1,4 +1,4 @@
-# 菲比主动上下文压缩 1.0.2
+# 菲比主动上下文压缩 1.0.3
 
 针对 AstrBot **4.29.1、内置 AI（local runner）** 开发。提供真实的 `/compact` 指令及独立历史长度触发阈值，不需要修改人格提示词来假装执行压缩。
 
@@ -104,3 +104,11 @@ python -m unittest discover -s astrbot_plugin_feibi_compact/tests -v
 日志 `summarized_chunk=4/52` 是整体进度，`resumed_chunk=24/52` 是恢复断点，`shortening_chunk` 是精简。`auto_check` 记录历史估算和阈值，`auto_skip` 记录冷却、未授权、关闭、其他压缩任务占用等原因。请求历史不匹配数据库前缀时仍拒绝自动改写，需检查其他插件或手动压缩。
 
 本插件阈值独立于AstrBot自带压缩和真实模型窗口。失败的自动尝试仍保留原请求，不保证其一定能在模型窗口内；请检查失败日志。上下文压缩也不能替代服务器内存和并发控制。
+
+## 1.0.3 分段精简兜底
+
+整份摘要精简两次仍超安全上限时，将完整候选分成最多4000字符的小段，逐段精简后拼合；最多3轮，且必须缩短，所有请求仍计入 max_summary_calls 和超时预算。不会截断正文，也不能保证不遵守精简要求的模型一定成功；无法缩短时建议更换 summary_provider_id。更换Provider不改变断点指纹，但不要修改 chunk_chars、keep_recent_rounds、summary_max_chars，否则断点可能失效。
+
+兼容1.0.2已完成块的断点（未修改v2指纹及摘要指令）。手动或自动尝试结束时启动冷却，防止长任务失败后立即自动重复。超时信息区分 request_timeout 和 total_timeout。日志 reducing_chunk=N/T round=R/3 piece=P/Q 表示分段精简。
+
+本版本新增回归测试；当前执行环境不可用，新增测试尚未运行。测试使用模拟框架，不能替代真实AstrBot集成验证。停止插件时最多等待取消任务10秒，已停止任务不得提交历史。

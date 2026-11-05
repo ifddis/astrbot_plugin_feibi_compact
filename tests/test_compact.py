@@ -152,6 +152,22 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 0)
         self.assertIn('完整摘要', result[1]['content'])
 
+    async def test_segmented_reduction_recovers_after_two_failed_retries(self):
+        prompts, reductions = [], []
+        async def model(prompt, system):
+            prompts.append(prompt)
+            if "<summary_piece>" in prompt:
+                return "关键事实"
+            return "长" * 1700
+        result, calls = await summarize(history(), model, chunk_chars=100000,
+            summary_chars=500, reduction_progress=lambda *a: reductions.append(a))
+        self.assertEqual(calls, 7)  # original + 2 retries + 4 pieces
+        self.assertEqual(len(reductions), 4)
+        self.assertIn("关键事实", result[1]["content"])
+        pieces = [p.split("<summary_piece>\n")[1].split("\n</summary_piece>")[0]
+                  for p in prompts if "<summary_piece>" in p]
+        self.assertEqual("".join(pieces), "长" * 1700)
+
     async def test_multimedia_payload_not_sent(self):
         messages = [{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,SECRET"}}, {"type":"text", "text":"图片说明"}]}]
         text = ''.join(chunks(messages, 2000))
@@ -263,6 +279,30 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await fresh.run_compact(Event(), conv2, h2)
         self.assertEqual(manager2.writes, 1)
         self.assertFalse(path.exists())
+
+    async def test_manual_failure_starts_auto_cooldown(self):
+        async def fail(**kwargs): raise RuntimeError("provider failure")
+        plugin, manager = self.make(types.SimpleNamespace(text_chat=fail))
+        awaitables = [s async for s in plugin.compact(Event())]
+        self.assertIn("test-cid", plugin.last_attempt)
+        attempts = 0
+        async def should_not_run(*args):
+            nonlocal attempts
+            attempts += 1
+        plugin.run_compact = should_not_run
+        req = types.SimpleNamespace(conversation=await manager.get_conversation("", "test-cid"),
+                                    contexts=list(manager.h))
+        await plugin.auto_compact(Event(), req)
+        self.assertEqual(attempts, 0)
+        self.assertEqual(manager.writes, 0)
+
+    async def test_request_timeout_reports_correct_setting(self):
+        async def timeout(**kwargs): raise TimeoutError()
+        plugin, manager = self.make(types.SimpleNamespace(text_chat=timeout))
+        conv, h = await plugin.current(Event())
+        with self.assertRaisesRegex(CompactError, "request_timeout"):
+            await plugin.run_compact(Event(), conv, h)
+        self.assertEqual(manager.writes, 0)
 
     async def test_manual_denies_nonadmin(self):
         plugin, manager = self.make()
